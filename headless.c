@@ -8,6 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <ctype.h>
+#include <getopt.h>
+#include <unistd.h>
 
 static char *read_file(const char *path, size_t *out_size)
 {
@@ -24,6 +27,65 @@ static char *read_file(const char *path, size_t *out_size)
     return buf;
 }
 
+/* Resolve a font by file path or family name via fontconfig (fc-match).
+ * Returns a malloc'd path on success, NULL on failure. */
+static char *resolve_font(const char *name_or_path)
+{
+    if (access(name_or_path, R_OK) == 0)
+        return strdup(name_or_path);
+
+    /* Sanitize for shell: only allow alphanumeric, space, hyphen, underscore */
+    for (const char *p = name_or_path; *p; p++) {
+        if (!isalnum((unsigned char)*p) && *p != ' ' && *p != '-' && *p != '_') {
+            fprintf(stderr, "Error: invalid font name '%s'\n", name_or_path);
+            return NULL;
+        }
+    }
+
+    char cmd[512];
+    snprintf(cmd, sizeof cmd, "fc-match --format=%%{file} '%s'", name_or_path);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return NULL;
+    char buf[1024];
+    if (!fgets(buf, sizeof buf, fp)) { pclose(fp); return NULL; }
+    pclose(fp);
+    size_t len = strlen(buf);
+    while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r'))
+        buf[--len] = '\0';
+    if (len == 0 || access(buf, R_OK) != 0) return NULL;
+    return strdup(buf);
+}
+
+static void print_help(const char *prog)
+{
+    printf(
+        "Usage: %s [OPTIONS] [TEXT...]\n\n"
+        "Headless Slug GPU text renderer -- renders text to a PPM image.\n\n"
+        "Options:\n"
+        "  -h, --help            Show this help and exit\n"
+        "  -f, --font PATH|NAME  Font file or family name (default: sans-serif via fontconfig)\n"
+        "  -s, --size PIXELS     Base font size in pixels (default: 200)\n"
+        "  -S, --scale FACTOR    Scale multiplier for output (default: 1.0)\n"
+        "  -o, --output PATH     Output file (default: output.ppm)\n"
+        "  -W, --width PIXELS    Image width  (default: auto-fit to text)\n"
+        "  -H, --height PIXELS   Image height (default: auto-fit to text)\n"
+        "  -p, --padding PIXELS  Padding around text (default: 20)\n"
+        "\n"
+        "Remaining arguments are joined as the text to render.\n"
+        "If no text is given, renders \"Hello, Slug!\".\n"
+        "\n"
+        "Font resolution:\n"
+        "  If --font is a readable file path, it is used directly.\n"
+        "  Otherwise it is resolved as a family name via fontconfig (fc-match).\n"
+        "  If --font is omitted, the default sans-serif font is used.\n"
+        "\n"
+        "Examples:\n"
+        "  %s Hello World\n"
+        "  %s -f 'DejaVu Sans' -s 100 --scale 2 -o big.ppm \"GPU text\"\n"
+        "  %s -f /usr/share/fonts/TTF/DejaVuSans.ttf Greetings\n",
+        prog, prog, prog, prog);
+}
+
 static volatile int g_mapped = 0;
 static void map_cb(WGPUMapAsyncStatus status, WGPUStringView msg, void *u1, void *u2) {
     (void)msg; (void)u1; (void)u2;
@@ -32,29 +94,114 @@ static void map_cb(WGPUMapAsyncStatus status, WGPUStringView msg, void *u1, void
 
 int main(int argc, char **argv)
 {
-    const char *fontPath = argc > 1 ? argv[1] : "Inter.ttf";
-    const char *text     = argc > 2 ? argv[2] : "AVA";
-    const char *outPath  = argc > 3 ? argv[3] : "output.ppm";
-    const float fontSize = 200.0f;
-    const int W = 512, H = 512;
+    const char *fontSpec = NULL;
+    const char *outPath  = "output.ppm";
+    float fontSize       = 200.0f;
+    float scaleFactor    = 1.0f;
+    int userW = 0, userH = 0;   /* 0 = auto-fit */
+    int padding = 20;
+
+    static struct option longopts[] = {
+        {"help",    no_argument,       NULL, 'h'},
+        {"font",    required_argument, NULL, 'f'},
+        {"size",    required_argument, NULL, 's'},
+        {"scale",   required_argument, NULL, 'S'},
+        {"output",  required_argument, NULL, 'o'},
+        {"width",   required_argument, NULL, 'W'},
+        {"height",  required_argument, NULL, 'H'},
+        {"padding", required_argument, NULL, 'p'},
+        {NULL, 0, NULL, 0}
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "hf:s:S:o:W:H:p:", longopts, NULL)) != -1) {
+        switch (opt) {
+        case 'h': print_help(argv[0]); return 0;
+        case 'f': fontSpec = optarg; break;
+        case 's': fontSize = (float)atof(optarg); break;
+        case 'S': scaleFactor = (float)atof(optarg); break;
+        case 'o': outPath = optarg; break;
+        case 'W': userW = atoi(optarg); break;
+        case 'H': userH = atoi(optarg); break;
+        case 'p': padding = atoi(optarg); break;
+        default:  print_help(argv[0]); return 1;
+        }
+    }
+
+    /* Remaining non-option args become the text (joined with spaces) */
+    char *textBuf = NULL;
+    const char *text;
+    if (optind < argc) {
+        size_t total = 0;
+        for (int i = optind; i < argc; i++)
+            total += strlen(argv[i]) + 1;
+        textBuf = (char *)malloc(total);
+        textBuf[0] = '\0';
+        for (int i = optind; i < argc; i++) {
+            if (i > optind) strcat(textBuf, " ");
+            strcat(textBuf, argv[i]);
+        }
+        text = textBuf;
+    } else {
+        text = "Hello, Slug!";
+    }
+
+    /* Resolve font */
+    char *fontPath;
+    if (fontSpec) {
+        fontPath = resolve_font(fontSpec);
+        if (!fontPath) {
+            fprintf(stderr, "Error: could not find font '%s'\n", fontSpec);
+            free(textBuf);
+            return 1;
+        }
+    } else {
+        fontPath = resolve_font("sans-serif");
+        if (!fontPath) {
+            fprintf(stderr, "Error: no --font specified and fontconfig could not find a default font.\n"
+                            "Install fontconfig or specify a font with --font.\n");
+            free(textBuf);
+            return 1;
+        }
+    }
+
+    float effectiveSize = fontSize * scaleFactor;
+    fprintf(stderr, "Font:  %s\n", fontPath);
+    fprintf(stderr, "Size:  %.0f px (scale %.2fx -> %.0f px)\n",
+            fontSize, scaleFactor, effectiveSize);
+    fprintf(stderr, "Text:  \"%s\"\n", text);
 
     /* Load font */
     size_t fontSz;
     unsigned char *fontBlob = (unsigned char *)read_file(fontPath, &fontSz);
-    if (!fontBlob) return 1;
+    if (!fontBlob) { free(fontPath); free(textBuf); return 1; }
     stbtt_fontinfo font;
     if (!stbtt_InitFont(&font, fontBlob, stbtt_GetFontOffsetForIndex(fontBlob, 0))) {
-        fprintf(stderr, "Failed to parse font\n"); return 1;
+        fprintf(stderr, "Failed to parse font '%s'\n", fontPath);
+        free(fontBlob); free(fontPath); free(textBuf);
+        return 1;
     }
 
     /* Prepare slug data */
-    SlugTextData sd = slug_prepare_text(&font, text, fontSize);
-    if (sd.indexCount == 0) { fprintf(stderr, "No glyphs\n"); return 1; }
+    SlugTextData sd = slug_prepare_text(&font, text, effectiveSize);
+    if (sd.indexCount == 0) {
+        fprintf(stderr, "No renderable glyphs in \"%s\"\n", text);
+        free(fontBlob); free(fontPath); free(textBuf);
+        return 1;
+    }
 
-    float scale = stbtt_ScaleForPixelHeight(&font, fontSize);
+    float scale = stbtt_ScaleForPixelHeight(&font, effectiveSize);
     int ascent_i, descent_i, lineGap_i;
     stbtt_GetFontVMetrics(&font, &ascent_i, &descent_i, &lineGap_i);
     float descender = descent_i * scale;
+
+    /* Compute image dimensions (auto-fit or user override) */
+    float totalWidth = sd.totalAdvance * scale;
+    float textHeight = (ascent_i - descent_i) * scale;
+
+    const int W = userW > 0 ? userW : (int)ceilf(totalWidth + 2.0f * padding);
+    const int H = userH > 0 ? userH : (int)ceilf(textHeight + 2.0f * padding);
+    fprintf(stderr, "Image: %dx%d\n", W, H);
 
     /* WGVK headless init — just device+queue, no window */
     wgpu_base base = wgpu_init();
@@ -216,8 +363,6 @@ int main(int argc, char **argv)
 
     /* Set up uniforms */
     float fw = (float)W, fh = (float)H;
-    float totalWidth = sd.totalAdvance * scale;
-    float textHeight = (ascent_i - descent_i) * scale;
     float offX = (fw - totalWidth) / 2.0f;
     float offY = (fh - textHeight) / 2.0f + (-descender);
 
@@ -282,6 +427,8 @@ int main(int argc, char **argv)
     /* Cleanup */
     slug_free_text_data(&sd);
     free(fontBlob);
+    free(fontPath);
+    free(textBuf);
     free(vsSrc);
     free(fsSrc);
     return 0;

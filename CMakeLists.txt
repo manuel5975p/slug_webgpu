@@ -70,3 +70,14 @@ endif()
 # Copy shader files to build directory so the executable can find them
 configure_file(SlugVertexShader.wgsl ${CMAKE_CURRENT_BINARY_DIR}/SlugVertexShader.wgsl COPYONLY)
 configure_file(SlugPixelShader.wgsl  ${CMAKE_CURRENT_BINARY_DIR}/SlugPixelShader.wgsl  COPYONLY)
+
+add_executable(test_var_gpu /tmp/test_var_gpu.c)
+target_include_directories(test_var_gpu PRIVATE "${WGVK_SOURCE_DIR}/examples")
+target_link_libraries(test_var_gpu PUBLIC wgvk glfw)
+
+add_executable(test_slug_compute /tmp/test_slug_compute.c)
+target_include_directories(test_slug_compute PRIVATE "${WGVK_SOURCE_DIR}/examples")
+target_link_libraries(test_slug_compute PUBLIC wgvk glfw)
+if(NOT MSVC)
+    target_link_libraries(test_slug_compute PUBLIC m)
+endif()
