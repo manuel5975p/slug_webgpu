@@ -6,6 +6,38 @@
 #include <math.h>
 
 /* ------------------------------------------------------------------ */
+/*  Internal types (not exposed in slug.h)                            */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    float p0x, p0y, p1x, p1y, p2x, p2y;
+} SlugQuadCurve;
+
+typedef struct {
+    float xMin, yMin, xMax, yMax;
+} SlugBounds;
+
+typedef struct {
+    int *curveIndices;
+    int count;
+} SlugBandEntry;
+
+typedef struct {
+    SlugBandEntry *hBands;
+    SlugBandEntry *vBands;
+    int hBandCount;
+    int vBandCount;
+} SlugGlyphBands;
+
+typedef struct {
+    int glyphId;
+    SlugQuadCurve *curves;
+    int curveCount;
+    SlugGlyphBands bands;
+    SlugBounds bounds;
+} SlugGlyph;
+
+/* ------------------------------------------------------------------ */
 /*  Utilities                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -331,17 +363,40 @@ static void free_glyph_bands(SlugGlyphBands *b)
 /*  Public API                                                        */
 /* ------------------------------------------------------------------ */
 
+/* Decode one UTF-8 codepoint, advance *pos by the number of bytes consumed. */
+static int utf8_next(const char *s, int len, int *pos)
+{
+    unsigned char c = (unsigned char)s[*pos];
+    int cp, n;
+    if (c < 0x80)                              { cp = c;                                     n = 1; }
+    else if ((c & 0xE0) == 0xC0 && *pos+1<len) { cp = (c&0x1F)<<6  | (s[*pos+1]&0x3F);      n = 2; }
+    else if ((c & 0xF0) == 0xE0 && *pos+2<len) { cp = (c&0x0F)<<12 | (s[*pos+1]&0x3F)<<6
+                                                      | (s[*pos+2]&0x3F);                     n = 3; }
+    else if ((c & 0xF8) == 0xF0 && *pos+3<len) { cp = (c&0x07)<<18 | (s[*pos+1]&0x3F)<<12
+                                                      | (s[*pos+2]&0x3F)<<6 | (s[*pos+3]&0x3F); n = 4; }
+    else                                       { cp = 0xFFFD;                                n = 1; }
+    *pos += n;
+    return cp;
+}
+
 SlugTextData slug_prepare_text(const stbtt_fontinfo *font,
                                const char *text, float fontSize)
 {
     SlugTextData res = {0};
-    int tl = (int)strlen(text);
+    int byteLen = (int)strlen(text);
     float scale = stbtt_ScaleForPixelHeight(font, fontSize);
+
+    /* Decode UTF-8 → codepoints */
+    int *cp = (int *)malloc(byteLen * sizeof(int));  /* upper bound */
+    int tl = 0;
+    for (int pos = 0; pos < byteLen; )
+        cp[tl++] = utf8_next(text, byteLen, &pos);
 
     /* map codepoints → glyph indices */
     int *gi = (int *)malloc(tl * sizeof(int));
     for (int i = 0; i < tl; i++)
-        gi[i] = stbtt_FindGlyphIndex(font, (unsigned char)text[i]);
+        gi[i] = stbtt_FindGlyphIndex(font, cp[i]);
+    free(cp);
 
     /* collect unique glyphs */
     SlugGlyph *sg = (SlugGlyph *)calloc(tl, sizeof(SlugGlyph));
@@ -449,6 +504,176 @@ SlugTextData slug_prepare_text(const stbtt_fontinfo *font,
     for (int i = 0; i < sgc; i++) { free(sg[i].curves); free_glyph_bands(&sg[i].bands); }
     free(sg);
     free(gi);
+    return res;
+}
+
+SlugTextData slug_prepare_runs(const SlugTextRun *runs, int runCount)
+{
+    SlugTextData res = {0};
+    if (runCount <= 0) return res;
+
+    typedef struct { int glyphId; const stbtt_fontinfo *font; } GlyphKey;
+
+    int totalCharsUB = 0;
+    for (int r = 0; r < runCount; r++)
+        totalCharsUB += (int)strlen(runs[r].text);
+    if (totalCharsUB == 0) return res;
+
+    SlugGlyph *sg = (SlugGlyph *)calloc(totalCharsUB, sizeof(SlugGlyph));
+    GlyphKey *sgKey = (GlyphKey *)calloc(totalCharsUB, sizeof(GlyphKey));
+    int sgc = 0;
+
+    typedef struct { int *gi; int charCount; } RunInfo;
+    RunInfo *ri = (RunInfo *)calloc(runCount, sizeof(RunInfo));
+
+    for (int r = 0; r < runCount; r++) {
+        int byteLen = (int)strlen(runs[r].text);
+        if (byteLen == 0) { ri[r].gi = NULL; ri[r].charCount = 0; continue; }
+
+        int *cp = (int *)malloc(byteLen * sizeof(int));
+        int tl = 0;
+        for (int pos = 0; pos < byteLen; )
+            cp[tl++] = utf8_next(runs[r].text, byteLen, &pos);
+
+        int *gi = (int *)malloc(tl * sizeof(int));
+        for (int i = 0; i < tl; i++)
+            gi[i] = stbtt_FindGlyphIndex(runs[r].font, cp[i]);
+        free(cp);
+
+        ri[r].gi = gi;
+        ri[r].charCount = tl;
+
+        for (int i = 0; i < tl; i++) {
+            int found = 0;
+            for (int j = 0; j < sgc; j++)
+                if (sgKey[j].glyphId == gi[i] && sgKey[j].font == runs[r].font)
+                    { found = 1; break; }
+            if (found) continue;
+
+            SlugQuadCurve *curves;
+            SlugBounds bounds;
+            int nc = extract_curves(runs[r].font, gi[i], &curves, &bounds);
+            if (nc <= 0) continue;
+
+            SlugGlyphBands bands;
+            build_bands(curves, nc, &bounds, SLUG_BAND_COUNT, &bands);
+            sgKey[sgc] = (GlyphKey){gi[i], runs[r].font};
+            sg[sgc++] = (SlugGlyph){gi[i], curves, nc, bands, bounds};
+        }
+    }
+
+    if (sgc == 0) {
+        free(sg); free(sgKey);
+        for (int r = 0; r < runCount; r++) free(ri[r].gi);
+        free(ri);
+        return res;
+    }
+
+    PackedData pk = pack_glyph_data(sg, sgc);
+
+    int totalChars = 0;
+    for (int r = 0; r < runCount; r++) totalChars += ri[r].charCount;
+
+    float    *verts = (float *)   malloc(totalChars * 4 * 20 * sizeof(float));
+    uint32_t *idxs  = (uint32_t *)malloc(totalChars * 6 * sizeof(uint32_t));
+    int vc = 0, ic = 0, qi = 0;
+    float maxAdvancePx = 0;
+
+    for (int r = 0; r < runCount; r++) {
+        if (ri[r].charCount == 0) continue;
+
+        float scale = stbtt_ScaleForPixelHeight(runs[r].font, runs[r].fontSize);
+        float cursorX = 0;
+
+        for (int i = 0; i < ri[r].charCount; i++) {
+            int gid = ri[r].gi[i];
+            int adv, lsb;
+            stbtt_GetGlyphHMetrics(runs[r].font, gid, &adv, &lsb);
+
+            int si = -1;
+            for (int j = 0; j < sgc; j++)
+                if (sg[j].glyphId == gid && sgKey[j].font == runs[r].font)
+                    { si = j; break; }
+
+            if (si < 0) {
+                cursorX += adv;
+                if (i + 1 < ri[r].charCount)
+                    cursorX += stbtt_GetGlyphKernAdvance(runs[r].font, gid, ri[r].gi[i+1]);
+                continue;
+            }
+
+            SlugGlyph *g = &sg[si];
+            float xMin = g->bounds.xMin, yMin = g->bounds.yMin;
+            float xMax = g->bounds.xMax, yMax = g->bounds.yMax;
+            float w = xMax - xMin, h = yMax - yMin;
+
+            float ox = runs[r].offsetX + cursorX * scale;
+            float oy = runs[r].offsetY;
+            float x0 = ox + xMin * scale, y0 = oy + yMin * scale;
+            float x1 = ox + xMax * scale, y1 = oy + yMax * scale;
+
+            float bsX = w > 0 ? (float)g->bands.vBandCount / w : 0;
+            float bsY = h > 0 ? (float)g->bands.hBandCount / h : 0;
+            float boX = -xMin * bsX, boY = -yMin * bsY;
+
+            float glp = pack_u32_as_f32(((uint32_t)pk.glyphLocY[si] << 16)
+                                       | (uint32_t)pk.glyphLocX[si]);
+            float bmp = pack_u32_as_f32(((uint32_t)(g->bands.hBandCount - 1) << 16)
+                                       | (uint32_t)(g->bands.vBandCount - 1));
+            float is = 1.0f / scale;
+
+            float corners[4][6] = {
+                {x0,y0,-1,-1,xMin,yMin},
+                {x1,y0, 1,-1,xMax,yMin},
+                {x1,y1, 1, 1,xMax,yMax},
+                {x0,y1,-1, 1,xMin,yMax},
+            };
+
+            for (int c = 0; c < 4; c++) {
+                float *v = &verts[vc * 20];
+                v[ 0]=corners[c][0]; v[ 1]=corners[c][1]; v[ 2]=corners[c][2]; v[ 3]=corners[c][3];
+                v[ 4]=corners[c][4]; v[ 5]=corners[c][5]; v[ 6]=glp;           v[ 7]=bmp;
+                v[ 8]=is;            v[ 9]=0;              v[10]=0;             v[11]=is;
+                v[12]=bsX;           v[13]=bsY;            v[14]=boX;           v[15]=boY;
+                v[16]=1;             v[17]=1;              v[18]=1;             v[19]=1;
+                vc++;
+            }
+
+            uint32_t base = qi * 4;
+            idxs[ic++]=base; idxs[ic++]=base+1; idxs[ic++]=base+2;
+            idxs[ic++]=base; idxs[ic++]=base+2; idxs[ic++]=base+3;
+
+            float rightEdge = ox + xMax * scale;
+            if (rightEdge > maxAdvancePx) maxAdvancePx = rightEdge;
+
+            cursorX += adv;
+            if (i + 1 < ri[r].charCount)
+                cursorX += stbtt_GetGlyphKernAdvance(runs[r].font, gid, ri[r].gi[i+1]);
+            qi++;
+        }
+
+        float runRight = runs[r].offsetX + cursorX * scale;
+        if (runRight > maxAdvancePx) maxAdvancePx = runRight;
+    }
+
+    res.vertices      = verts;
+    res.indices        = idxs;
+    res.vertexCount    = vc;
+    res.indexCount     = ic;
+    res.curveTexData   = pk.curveTexData;
+    res.bandTexData    = pk.bandTexData;
+    res.curveTexHeight = pk.curveTexHeight;
+    res.bandTexHeight  = pk.bandTexHeight;
+    res.totalAdvance   = maxAdvancePx;
+
+    free(pk.glyphLocX);
+    free(pk.glyphLocY);
+    free(pk.glyphCurveStarts);
+    for (int i = 0; i < sgc; i++) { free(sg[i].curves); free_glyph_bands(&sg[i].bands); }
+    free(sg);
+    free(sgKey);
+    for (int r = 0; r < runCount; r++) free(ri[r].gi);
+    free(ri);
     return res;
 }
 

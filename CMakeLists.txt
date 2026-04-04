@@ -47,8 +47,8 @@ if(NOT EXISTS "${STB_DIR}/stb_truetype.h")
 endif()
 
 # --- Build targets ---
-add_executable(slug_wgvk main.c slug.c)
-add_executable(slug_headless headless.c slug.c)
+add_executable(slug_wgvk main.c slug.c slug_math.c)
+add_executable(slug_headless headless.c slug.c slug_math.c)
 target_include_directories(slug_wgvk PRIVATE
     "${STB_DIR}"
     "${WGVK_SOURCE_DIR}/examples"   # for common.h
@@ -70,14 +70,3 @@ endif()
 # Copy shader files to build directory so the executable can find them
 configure_file(SlugVertexShader.wgsl ${CMAKE_CURRENT_BINARY_DIR}/SlugVertexShader.wgsl COPYONLY)
 configure_file(SlugPixelShader.wgsl  ${CMAKE_CURRENT_BINARY_DIR}/SlugPixelShader.wgsl  COPYONLY)
-
-add_executable(test_var_gpu /tmp/test_var_gpu.c)
-target_include_directories(test_var_gpu PRIVATE "${WGVK_SOURCE_DIR}/examples")
-target_link_libraries(test_var_gpu PUBLIC wgvk glfw)
-
-add_executable(test_slug_compute /tmp/test_slug_compute.c)
-target_include_directories(test_slug_compute PRIVATE "${WGVK_SOURCE_DIR}/examples")
-target_link_libraries(test_slug_compute PUBLIC wgvk glfw)
-if(NOT MSVC)
-    target_link_libraries(test_slug_compute PUBLIC m)
-endif()

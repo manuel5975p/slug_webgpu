@@ -4,6 +4,7 @@
  */
 #include <webgpu/webgpu.h>
 #include "slug.h"
+#include "slug_math.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -142,6 +143,7 @@ static void print_help(const char *prog)
         "  -W, --width PIXELS    Image width  (default: auto-fit to text)\n"
         "  -H, --height PIXELS   Image height (default: auto-fit to text)\n"
         "  -p, --padding PIXELS  Padding around text (default: 20)\n"
+        "  -m, --math            Enable math markup (^{} _{} \\frac{}{})\n"
         "\n"
         "Output format is chosen by file extension: .png (default) or .ppm.\n"
         "Remaining arguments are joined as the text to render.\n"
@@ -173,6 +175,7 @@ int main(int argc, char **argv)
     float scaleFactor    = 1.0f;
     int userW = 0, userH = 0;   /* 0 = auto-fit */
     int padding = 20;
+    int mathMode = 0;
 
     static struct option longopts[] = {
         {"help",    no_argument,       NULL, 'h'},
@@ -183,11 +186,12 @@ int main(int argc, char **argv)
         {"width",   required_argument, NULL, 'W'},
         {"height",  required_argument, NULL, 'H'},
         {"padding", required_argument, NULL, 'p'},
+        {"math",    no_argument,       NULL, 'm'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "hf:s:S:o:W:H:p:", longopts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hmf:s:S:o:W:H:p:", longopts, NULL)) != -1) {
         switch (opt) {
         case 'h': print_help(argv[0]); return 0;
         case 'f': fontSpec = optarg; break;
@@ -197,6 +201,7 @@ int main(int argc, char **argv)
         case 'W': userW = atoi(optarg); break;
         case 'H': userH = atoi(optarg); break;
         case 'p': padding = atoi(optarg); break;
+        case 'm': mathMode = 1; break;
         default:  print_help(argv[0]); return 1;
         }
     }
@@ -256,7 +261,12 @@ int main(int argc, char **argv)
     }
 
     /* Prepare slug data */
-    SlugTextData sd = slug_prepare_text(&font, text, effectiveSize);
+    SlugTextData sd;
+    if (mathMode) {
+        sd = slug_prepare_math_text(&font, 1, text, effectiveSize);
+    } else {
+        sd = slug_prepare_text(&font, text, effectiveSize);
+    }
     if (sd.indexCount == 0) {
         fprintf(stderr, "No renderable glyphs in \"%s\"\n", text);
         free(fontBlob); free(fontPath); free(textBuf);
@@ -269,8 +279,21 @@ int main(int argc, char **argv)
     float descender = descent_i * scale;
 
     /* Compute image dimensions (auto-fit or user override) */
-    float totalWidth = sd.totalAdvance * scale;
+    float totalWidth = mathMode ? sd.totalAdvance : sd.totalAdvance * scale;
     float textHeight = (ascent_i - descent_i) * scale;
+
+    /* For math mode, scan vertices to find actual bounding box since
+       fractions/superscripts extend beyond normal ascent/descent. */
+    if (mathMode && sd.vertexCount >= 4) {
+        float yMin = sd.vertices[1], yMax = sd.vertices[1];
+        for (int i = 0; i < sd.vertexCount; i++) {
+            float y = sd.vertices[i * 20 + 1]; /* y is at offset 1 in each 20-float vertex */
+            if (y < yMin) yMin = y;
+            if (y > yMax) yMax = y;
+        }
+        textHeight = yMax - yMin;
+        descender = yMin; /* lowest point becomes the descender */
+    }
 
     const int W = userW > 0 ? userW : (int)ceilf(totalWidth + 2.0f * padding);
     const int H = userH > 0 ? userH : (int)ceilf(textHeight + 2.0f * padding);
